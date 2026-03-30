@@ -65,6 +65,37 @@ Practical implication:
 - budgets per tool and repeated-call detection are worth implementing;
 - a disciplined agent can beat a more verbose and expensive one.
 
+## New Signals From The Organizer Post
+
+The organizer shared an additional public note about the current Sandbox and the expected runtime for the main event on `2026-04-11`.
+
+Direct signals from that post:
+
+- Sandbox has passed the smoke-test phase.
+- Engineers are already connecting to Harness and receiving action-based evaluation.
+- The current Sandbox is intentionally simple: an Obsidian-like folder with markdown files and typed records.
+- Sandbox currently has only `7` tasks and does not require authorization.
+- The main competition runtime is expected to simulate more tools than the current Sandbox.
+- The organizer explicitly mentioned chats, email, remote server access, and destructive commands as likely runtime elements.
+- Leaderboards, profiles, keys, debug mode, and related platform features are expected to be enabled soon.
+
+Practical implication:
+
+- do not overfit to Sandbox because it is a smoke-test environment, not a faithful proxy of the final runtime;
+- treat PAC1 file-work as the current floor, not the final ceiling;
+- expect prompt injection to arrive through multiple channels, not only files;
+- design the agent around trust boundaries between trusted instructions and untrusted chat, email, or remote content;
+- prepare for higher-risk tool classes such as network access and destructive actions;
+- move more safety rules from prompt text into runtime checks;
+- build local traces and internal debugging now so we are not blocked while waiting for the official debug features to land.
+
+Concrete engineering takeaway:
+
+- the agent architecture should be tool-agnostic and risk-aware;
+- it should support multiple tool classes with different safety policies;
+- it should treat incoming messages, emails, and remote responses as untrusted by default;
+- it should gate destructive actions much more strictly than read-only actions.
+
 ## What Follows From The Current PAC1 Sample
 
 ### Control Plane
