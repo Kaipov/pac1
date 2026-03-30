@@ -8,7 +8,7 @@ from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import StatusRequest, GetBenchmarkRequest, StartPlaygroundRequest, EvalPolicy, EndTrialRequest
 from connectrpc.errors import ConnectError
 
-from agent import run_agent
+from agent_tc import run_agent
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 
