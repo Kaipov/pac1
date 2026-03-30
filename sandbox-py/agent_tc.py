@@ -5,7 +5,11 @@ and decides when to call tools on its own.
 """
 
 import json
+import hashlib
+import posixpath
 import time
+from dataclasses import dataclass, field
+from typing import Any
 
 from google.protobuf.json_format import MessageToDict
 from openai import OpenAI
@@ -272,7 +276,310 @@ CLI_BLUE = "\x1B[34m"
 
 
 # =============================================================================
-# 4. Dispatch — выполнение инструментов
+# 4. Runtime state и валидация
+# =============================================================================
+
+
+class ToolValidationError(ValueError):
+    """Ошибка валидации вызова инструмента."""
+
+
+@dataclass
+class ToolObservation:
+    """Короткая запись о выполненном шаге для детектора зацикливания."""
+
+    signature: str
+    result_digest: str
+
+
+@dataclass
+class AgentState:
+    """Состояние рантайма, которое мы держим вне промпта."""
+
+    completed_steps: int = 0
+    tool_errors: int = 0
+    loop_blocks: int = 0
+    files_read: list[str] = field(default_factory=list)
+    files_written: list[str] = field(default_factory=list)
+    files_deleted: list[str] = field(default_factory=list)
+    known_file_refs: set[str] = field(default_factory=set)
+    _files_read_seen: set[str] = field(default_factory=set)
+    _files_written_seen: set[str] = field(default_factory=set)
+    _files_deleted_seen: set[str] = field(default_factory=set)
+    observations: list[ToolObservation] = field(default_factory=list)
+
+
+def append_unique_path(items: list[str], seen: set[str], path: str) -> None:
+    """Добавить путь в историю один раз, сохранив порядок появления."""
+
+    if not path or path == "/" or path in seen:
+        return
+
+    items.append(path)
+    seen.add(path)
+
+
+def normalize_vault_path(raw_path: Any, *, allow_root: bool) -> str:
+    """Привести путь к каноничному виду внутри корня vault."""
+
+    if not isinstance(raw_path, str):
+        raise ToolValidationError("path must be a string")
+
+    path = raw_path.strip().replace("\\", "/")
+    if not path:
+        raise ToolValidationError("path must not be empty")
+
+    if path != "/" and any(part == ".." for part in path.split("/")):
+        raise ToolValidationError("path must not contain '..'")
+
+    if ":" in path.split("/")[0]:
+        raise ToolValidationError("absolute OS paths are not allowed")
+
+    normalized = posixpath.normpath(path)
+    if normalized == ".":
+        normalized = "/"
+
+    # Все пути кроме корня храним в root-relative виде без ведущего slash.
+    if normalized.startswith("/") and normalized != "/":
+        normalized = normalized[1:]
+
+    if normalized == "/" and not allow_root:
+        raise ToolValidationError("root path '/' is not allowed here")
+
+    return normalized
+
+
+def normalize_grounding_refs(raw_refs: Any, state: AgentState) -> list[str]:
+    """Проверить и нормализовать grounding refs перед финальным ответом."""
+
+    if not isinstance(raw_refs, list):
+        raise ToolValidationError("grounding_refs must be an array of file paths")
+
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    for raw_ref in raw_refs:
+        ref = normalize_vault_path(raw_ref, allow_root=False)
+        if ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
+
+    if not refs:
+        raise ToolValidationError("grounding_refs must not be empty")
+
+    unknown_refs = [ref for ref in refs if ref not in state.known_file_refs]
+    if unknown_refs:
+        joined = ", ".join(unknown_refs)
+        raise ToolValidationError(f"grounding_refs contain unknown files: {joined}")
+
+    if state.files_read and not any(ref in state._files_read_seen for ref in refs):
+        raise ToolValidationError("at least one grounding ref must come from a previously read file")
+
+    return refs
+
+
+def parse_tool_arguments(raw_arguments: str) -> dict[str, Any]:
+    """Распарсить аргументы tool call и убедиться, что это JSON-объект."""
+
+    try:
+        args = json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError as exc:
+        raise ToolValidationError(f"tool arguments are not valid JSON: {exc.msg}") from exc
+
+    if not isinstance(args, dict):
+        raise ToolValidationError("tool arguments must be a JSON object")
+
+    return args
+
+
+def validate_and_normalize_tool_call(tool_name: str, raw_args: dict[str, Any], state: AgentState) -> dict[str, Any]:
+    """Проверить аргументы инструмента и привести их к одному формату."""
+
+    if tool_name == "tree":
+        return {"path": normalize_vault_path(raw_args.get("path"), allow_root=True)}
+
+    if tool_name == "search":
+        pattern = raw_args.get("pattern")
+        count = raw_args.get("count", 5)
+
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ToolValidationError("search.pattern must be a non-empty string")
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 10:
+            raise ToolValidationError("search.count must be an integer between 1 and 10")
+
+        return {
+            "pattern": pattern,
+            "path": normalize_vault_path(raw_args.get("path", "/"), allow_root=True),
+            "count": count,
+        }
+
+    if tool_name == "list":
+        return {"path": normalize_vault_path(raw_args.get("path"), allow_root=True)}
+
+    if tool_name == "read":
+        path = normalize_vault_path(raw_args.get("path"), allow_root=False)
+        return {"path": path}
+
+    if tool_name == "write":
+        path = normalize_vault_path(raw_args.get("path"), allow_root=False)
+        content = raw_args.get("content")
+        if not isinstance(content, str):
+            raise ToolValidationError("write.content must be a string")
+        return {"path": path, "content": content}
+
+    if tool_name == "delete":
+        path = normalize_vault_path(raw_args.get("path"), allow_root=False)
+        return {"path": path}
+
+    if tool_name == "report_completion":
+        answer = raw_args.get("answer")
+        code = raw_args.get("code")
+
+        if not isinstance(answer, str) or not answer.strip():
+            raise ToolValidationError("report_completion.answer must be a non-empty string")
+        if code not in {"completed", "failed"}:
+            raise ToolValidationError("report_completion.code must be either 'completed' or 'failed'")
+
+        return {
+            "answer": answer.strip(),
+            "grounding_refs": normalize_grounding_refs(raw_args.get("grounding_refs"), state),
+            "code": code,
+        }
+
+    raise ToolValidationError(f"unknown tool: {tool_name}")
+
+
+def build_structured_error(
+    code: str,
+    message: str,
+    *,
+    retryable: bool,
+    tool_name: str,
+    args: dict[str, Any] | None = None,
+) -> str:
+    """Сформировать единый JSON-ответ об ошибке для следующего шага модели."""
+
+    payload = {
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+            "tool_name": tool_name,
+        },
+    }
+    if args is not None:
+        payload["error"]["args"] = args
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def make_action_signature(tool_name: str, args: dict[str, Any]) -> str:
+    """Сигнатура действия нужна, чтобы сравнивать одинаковые вызовы."""
+
+    serialized_args = json.dumps(args, ensure_ascii=False, sort_keys=True)
+    return f"{tool_name}:{serialized_args}"
+
+
+def record_observation(state: AgentState, tool_name: str, args: dict[str, Any], result: str) -> None:
+    """Запомнить результат шага для будущего детектора зацикливания."""
+
+    digest = hashlib.sha1(result.encode("utf-8")).hexdigest()
+    state.observations.append(
+        ToolObservation(
+            signature=make_action_signature(tool_name, args),
+            result_digest=digest,
+        )
+    )
+
+
+def should_block_as_loop(state: AgentState, tool_name: str, args: dict[str, Any]) -> bool:
+    """Остановить третий подряд одинаковый вызов с тем же наблюдением."""
+
+    if len(state.observations) < 2:
+        return False
+
+    expected_signature = make_action_signature(tool_name, args)
+    last_two = state.observations[-2:]
+    return (
+        last_two[0].signature == expected_signature
+        and last_two[1].signature == expected_signature
+        and last_two[0].result_digest == last_two[1].result_digest
+    )
+
+
+def update_state_after_success(state: AgentState, tool_name: str, args: dict[str, Any]) -> None:
+    """Обновить короткое состояние рантайма после успешного шага."""
+
+    if tool_name == "read":
+        path = args["path"]
+        append_unique_path(state.files_read, state._files_read_seen, path)
+        state.known_file_refs.add(path)
+        return
+
+    if tool_name == "write":
+        path = args["path"]
+        append_unique_path(state.files_written, state._files_written_seen, path)
+        state.known_file_refs.add(path)
+        return
+
+    if tool_name == "delete":
+        path = args["path"]
+        append_unique_path(state.files_deleted, state._files_deleted_seen, path)
+        state.known_file_refs.add(path)
+
+
+def format_recent_paths(paths: list[str], limit: int = 3) -> str:
+    """Сжать список путей до короткой строки для state summary."""
+
+    if not paths:
+        return "-"
+
+    return ", ".join(paths[-limit:])
+
+
+def build_runtime_state_summary(state: AgentState) -> str:
+    """Собрать короткий runtime summary, который модель видит на каждом шаге."""
+
+    return (
+        "Runtime state: "
+        f"completed_steps={state.completed_steps}; "
+        f"read={format_recent_paths(state.files_read)}; "
+        f"written={format_recent_paths(state.files_written)}; "
+        f"deleted={format_recent_paths(state.files_deleted)}; "
+        f"tool_errors={state.tool_errors}; "
+        f"loop_blocks={state.loop_blocks}. "
+        "You may call at most one tool in this step. "
+        "Use normalized root-relative paths except '/' for the root. "
+        "For report_completion, cite only files already observed in this run."
+    )
+
+
+def build_assistant_tool_message(message_content: str | None, tool_call_id: str, tool_name: str, arguments: str) -> dict[str, Any]:
+    """Собрать assistant-сообщение вручную, чтобы держать в истории ровно один tool call."""
+
+    assistant_message: dict[str, Any] = {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": arguments,
+                },
+            }
+        ],
+    }
+
+    if message_content:
+        assistant_message["content"] = message_content
+
+    return assistant_message
+
+
+# =============================================================================
+# 5. Dispatch — выполнение инструментов
 # =============================================================================
 # Эта функция принимает имя инструмента и его аргументы,
 # и вызывает соответствующий метод BitGN runtime.
@@ -319,12 +626,13 @@ def dispatch(vm: MiniRuntimeClientSync, tool_name: str, args: dict):
 
 
 # =============================================================================
-# 5. Agent loop — основной цикл агента
+# 6. Agent loop — основной цикл агента
 # =============================================================================
 
 def run_agent(model: str, harness_url: str, task_text: str):
     client = OpenAI()
     vm = MiniRuntimeClientSync(harness_url)
+    state = AgentState()
 
     # История сообщений — контекст разговора между моделью и средой
     messages = [
@@ -335,16 +643,19 @@ def run_agent(model: str, harness_url: str, task_text: str):
     # Ограничиваем агента 30 шагами, чтобы не зациклился
     for i in range(30):
         step = i + 1
-        print(f"\n{'─'*60}")
+        # Используем ASCII-разделитель, чтобы лог не падал на Windows-консолях.
+        print(f"\n{'-'*60}")
         print(f"Step {step}...")
 
         # ─── Запрос к модели ───
         # Отправляем историю + доступные инструменты.
-        # Модель сама решает: вызвать инструмент или ответить текстом.
+        # К основной истории на лету добавляем короткое состояние рантайма.
+        runtime_state_message = {"role": "system", "content": build_runtime_state_summary(state)}
         resp = client.chat.completions.create(
             model=model,
-            messages=messages,
+            messages=[*messages, runtime_state_message],
             tools=tools,
+            parallel_tool_calls=False,
             max_completion_tokens=16384,
         )
 
@@ -355,49 +666,117 @@ def run_agent(model: str, harness_url: str, task_text: str):
         # Добавляем в историю и продолжаем цикл — на следующем шаге
         # она может вызвать инструмент.
         if not message.tool_calls:
-            print(f"  {CLI_BLUE}THINKING:{CLI_CLR} {message.content}")
-            messages.append({"role": "assistant", "content": message.content})
+            thinking = (message.content or "").strip()
+            print(f"  {CLI_BLUE}THINKING:{CLI_CLR} {thinking}")
+            messages.append({"role": "assistant", "content": message.content or ""})
+            state.completed_steps += 1
             continue
 
-        # ─── Вариант Б: модель вызвала инструмент(ы) ───
-        # Сначала сохраняем сообщение модели целиком (с tool_calls внутри)
-        messages.append(message)
+        # ─── Вариант Б: модель вызвала инструмент ───
+        # Даже если модель попыталась вызвать несколько инструментов,
+        # рантайм пропустит только первый и явно сообщит об этом в историю.
+        tool_calls = list(message.tool_calls)
+        selected_call = tool_calls[0]
+        tool_name = selected_call.function.name
+        raw_arguments = selected_call.function.arguments or "{}"
+        assistant_arguments = raw_arguments
+        task_completed = False
+        runtime_note = None
 
-        # Если модель также написала текст перед вызовом — выводим его
         if message.content:
             print(f"  {CLI_BLUE}REASONING:{CLI_CLR} {message.content}")
 
-        # Обрабатываем каждый вызов инструмента
-        task_completed = False
+        if len(tool_calls) > 1:
+            ignored = len(tool_calls) - 1
+            runtime_note = (
+                f"Runtime policy: only one tool call is allowed per step. "
+                f"Ignored {ignored} extra tool call(s) from the previous assistant turn."
+            )
+            print(f"  {CLI_RED}POLICY:{CLI_CLR} ignored {ignored} extra tool call(s)")
 
-        for tool_call in message.tool_calls:
-            name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
+        normalized_args: dict[str, Any] | None = None
+        result = ""
 
-            print(f"  {CLI_GREEN}CALL:{CLI_CLR} {name}({args})")
+        try:
+            parsed_args = parse_tool_arguments(raw_arguments)
+            normalized_args = validate_and_normalize_tool_call(tool_name, parsed_args, state)
+            assistant_arguments = json.dumps(normalized_args, ensure_ascii=False)
+        except ToolValidationError as exc:
+            result = build_structured_error(
+                "validation_error",
+                str(exc),
+                retryable=True,
+                tool_name=tool_name,
+            )
+            state.tool_errors += 1
+            print(f"  {CLI_RED}ERR:{CLI_CLR} validation failed: {exc}")
 
-            # Выполняем инструмент
-            try:
-                result = dispatch(vm, name, args)
-                print(f"  {CLI_GREEN}OUT:{CLI_CLR} {result}")
-            except ConnectError as e:
-                result = f"ERROR: {e.message}"
-                print(f"  {CLI_RED}ERR:{CLI_CLR} {e.code}: {e.message}")
+        # Сначала сохраняем в историю ровно один assistant tool call.
+        messages.append(
+            build_assistant_tool_message(
+                message.content,
+                selected_call.id,
+                tool_name,
+                assistant_arguments,
+            )
+        )
 
-            # Добавляем результат в историю для модели
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
-            })
+        if normalized_args is not None and not result:
+            print(f"  {CLI_GREEN}CALL:{CLI_CLR} {tool_name}({normalized_args})")
 
-            # Проверяем — если это report_completion, задача завершена
-            if name == "report_completion":
-                task_completed = True
-                print(f"\n  {CLI_BLUE}AGENT ANSWER: {args['answer']}{CLI_CLR}")
-                if args.get("grounding_refs"):
-                    for ref in args["grounding_refs"]:
+            if should_block_as_loop(state, tool_name, normalized_args):
+                state.loop_blocks += 1
+                state.tool_errors += 1
+                result = build_structured_error(
+                    "loop_detected",
+                    "The same tool call already produced the same result twice in a row. Choose a different action.",
+                    retryable=True,
+                    tool_name=tool_name,
+                    args=normalized_args,
+                )
+                print(f"  {CLI_RED}ERR:{CLI_CLR} repeated tool call blocked by loop detector")
+            else:
+                # Выполняем уже валидированный и нормализованный вызов.
+                dispatch_succeeded = False
+                try:
+                    result = dispatch(vm, tool_name, normalized_args)
+                    update_state_after_success(state, tool_name, normalized_args)
+                    dispatch_succeeded = True
+                    print(f"  {CLI_GREEN}OUT:{CLI_CLR} {result}")
+                except ConnectError as exc:
+                    result = build_structured_error(
+                        "tool_execution_error",
+                        exc.message,
+                        retryable=True,
+                        tool_name=tool_name,
+                        args=normalized_args,
+                    )
+                    state.tool_errors += 1
+                    print(f"  {CLI_RED}ERR:{CLI_CLR} {exc.code}: {exc.message}")
+
+                record_observation(state, tool_name, normalized_args, result)
+
+                if (
+                    dispatch_succeeded
+                    and tool_name == "report_completion"
+                    and normalized_args["code"] in {"completed", "failed"}
+                ):
+                    task_completed = True
+                    print(f"\n  {CLI_BLUE}AGENT ANSWER: {normalized_args['answer']}{CLI_CLR}")
+                    for ref in normalized_args["grounding_refs"]:
                         print(f"  - {CLI_BLUE}{ref}{CLI_CLR}")
+
+        # Добавляем результат в историю для следующего шага модели.
+        messages.append({
+            "role": "tool",
+            "tool_call_id": selected_call.id,
+            "content": result,
+        })
+
+        if runtime_note:
+            messages.append({"role": "system", "content": runtime_note})
+
+        state.completed_steps += 1
 
         if task_completed:
             break

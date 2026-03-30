@@ -22,6 +22,10 @@ Runnable Python sample for the `bitgn/sandbox` benchmark. This is a sandbox, so:
 
 You can also switch the OpenAI client to a provider of your choice if needed.
 
+## Experimental Notes
+
+- `NATIVE_TOOL_CALLING_ONE_STEP_CHECKLIST.md` captures a concrete hardening plan for the native tool-calling loop, with a focus on one-tool-per-step execution and stronger completion checks.
+
 ## Example Output
 
 It should print something like that:
