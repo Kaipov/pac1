@@ -9,6 +9,7 @@ dependencies = [
     "bitgn-api-protocolbuffers-python==34.1.0.1.20260324104753+6b18c777b19a",
     "openai>=2.26.0",
     "pydantic>=2.12.5",
+    "python-dotenv>=1.2.2",
 ]
 
 [[tool.uv.index]]
